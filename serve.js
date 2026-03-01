@@ -87,7 +87,11 @@ const SHIM = `<script>
         return data.entries || [];
       } catch(e) { return []; }
     },
-    getPathForFile: (f) => f?.name || '',
+    getPathForFile: function(f) {
+      // Return cached server path if file was already uploaded
+      if (f && f._serverPath) return f._serverPath;
+      return f?.name || '';
+    },
     getAllowedExtensions: () => Promise.resolve([]),
     setMenuBarIcon: noopAsync,
     getMenuBarIconState: () => Promise.resolve(true),
@@ -126,6 +130,33 @@ const SHIM = `<script>
     refreshApp: noopAsync,
     closeApp: noopAsync,
     addRecentDir: noopAsync,
+  };
+
+  // File upload interceptor: override getPathForFile to upload the file
+  // synchronously using sync XMLHttpRequest, returning the server path.
+  // The frontend calls this synchronously then puts the result in the text input.
+  window.electron.getPathForFile = function(f) {
+    if (!f || !f.name) return '';
+    try {
+      // Use sync XHR to upload — blocks until complete but ensures path is ready
+      // We can't use FileReader (async only in main thread), so we send the file
+      // via FormData with sync XHR
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', '/upload-sync', false);  // synchronous!
+      var formData = new FormData();
+      formData.append('file', f);
+      xhr.send(formData);
+      if (xhr.status === 200) {
+        var result = JSON.parse(xhr.responseText);
+        if (result.path) {
+          console.log('[Upload] ' + f.name + ' -> ' + result.path);
+          return result.path;
+        }
+      }
+    } catch(e) {
+      console.error('[Upload] Sync upload failed for ' + f.name + ':', e);
+    }
+    return f.name || '';
   };
 </script>`;
 
@@ -1202,13 +1233,65 @@ function handleDictationEndpoint(req, res, urlPath) {
 
 function handleUploadEndpoint(req, res, urlPath) {
   // CORS preflight
-  if (req.method === 'OPTIONS' && (urlPath === '/upload' || urlPath.startsWith('/uploads'))) {
+  if (req.method === 'OPTIONS' && (urlPath === '/upload' || urlPath === '/upload-sync' || urlPath.startsWith('/uploads'))) {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, X-Secret-Key, x-secret-key',
     });
     res.end();
+    return true;
+  }
+
+  // POST /upload-sync — accept FormData (multipart) file upload from browser
+  // Used by getPathForFile shim with sync XMLHttpRequest
+  if (req.method === 'POST' && urlPath === '/upload-sync') {
+    var chunks = [];
+    req.on('data', function(chunk) { chunks.push(chunk); });
+    req.on('end', function() {
+      try {
+        var rawBody = Buffer.concat(chunks);
+        var contentType = req.headers['content-type'] || '';
+        var boundary = contentType.split('boundary=')[1];
+        if (!boundary) {
+          jsonResponse(res, { error: 'No boundary in content-type' }, 400);
+          return;
+        }
+        // Parse multipart form data (simple parser for single file)
+        var boundaryBuf = Buffer.from('--' + boundary);
+        var parts = [];
+        var start = 0;
+        while (true) {
+          var idx = rawBody.indexOf(boundaryBuf, start);
+          if (idx === -1) break;
+          if (start > 0) parts.push(rawBody.slice(start, idx - 2)); // -2 for \r\n before boundary
+          start = idx + boundaryBuf.length + 2; // +2 for \r\n after boundary
+        }
+        // Find the file part
+        for (var i = 0; i < parts.length; i++) {
+          var part = parts[i];
+          var headerEnd = part.indexOf('\r\n\r\n');
+          if (headerEnd === -1) continue;
+          var headers = part.slice(0, headerEnd).toString();
+          var fileData = part.slice(headerEnd + 4);
+          var nameMatch = headers.match(/filename="([^"]+)"/);
+          if (!nameMatch) continue;
+          var originalName = nameMatch[1];
+          var safeName = originalName.replace(/[/\\:*?"<>|]/g, '_');
+          var fileName = Date.now() + '_' + safeName;
+          var filePath = path.join(UPLOADS_DIR, fileName);
+          fs.writeFileSync(filePath, fileData);
+          var sizeKB = (fileData.length / 1024).toFixed(1);
+          console.log('[Upload-Sync] Saved ' + safeName + ' (' + sizeKB + 'KB) -> ' + filePath);
+          jsonResponse(res, { path: filePath, name: safeName, size: fileData.length });
+          return;
+        }
+        jsonResponse(res, { error: 'No file found in upload' }, 400);
+      } catch(e) {
+        console.error('[Upload-Sync] Error:', e);
+        jsonResponse(res, { error: 'Upload failed: ' + e.message }, 500);
+      }
+    });
     return true;
   }
 
@@ -1398,7 +1481,7 @@ var server = http.createServer(function(req, res) {
   }
 
   // File upload
-  if (urlPath === '/upload' || urlPath.startsWith('/uploads')) {
+  if (urlPath === '/upload' || urlPath === '/upload-sync' || urlPath.startsWith('/uploads')) {
     if (handleUploadEndpoint(req, res, urlPath)) return;
   }
 
