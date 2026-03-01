@@ -48,12 +48,45 @@ const SHIM = `<script>
     fetchMetadata: noopAsync,
     reloadApp: () => location.reload(),
     checkForOllama: () => Promise.resolve(false),
-    selectFileOrDirectory: noopAsync,
+    selectFileOrDirectory: async function() {
+      return new Promise(function(resolve) {
+        var input = document.createElement('input');
+        input.type = 'file';
+        input.style.display = 'none';
+        document.body.appendChild(input);
+        input.onchange = async function() {
+          document.body.removeChild(input);
+          if (!input.files || !input.files[0]) { resolve(null); return; }
+          var file = input.files[0];
+          var reader = new FileReader();
+          reader.onload = async function() {
+            try {
+              var base64 = reader.result.split(',')[1];
+              var resp = await fetch('/upload', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({name: file.name, data: base64, mime_type: file.type, size: file.size})
+              });
+              var result = await resp.json();
+              resolve(result.path || null);
+            } catch(e) { console.error('Upload failed:', e); resolve(null); }
+          };
+          reader.readAsDataURL(file);
+        };
+        input.click();
+      });
+    },
     getBinaryPath: noopAsync,
     readFile: noopAsync,
     writeFile: noopAsync,
     ensureDirectory: noopAsync,
-    listFiles: noopAsync,
+    listFiles: async function(dir) {
+      try {
+        var resp = await fetch('/browse?path=' + encodeURIComponent(dir || ''));
+        var data = await resp.json();
+        return data.entries || [];
+      } catch(e) { return []; }
+    },
     getPathForFile: (f) => f?.name || '',
     getAllowedExtensions: () => Promise.resolve([]),
     setMenuBarIcon: noopAsync,
@@ -312,7 +345,51 @@ function handleConfigEndpoint(req, res, urlPath) {
 // We bridge between them here.
 
 var sessionCounter = 0;
-var activeSessions = {};  // sessionId -> { ws, messages }
+var activeSessions = {};  // sessionId -> { ws, messages, listeners, ... }
+var savedSessions = {};   // sessionId -> { id, name, created_at, updated_at, messages, message_count, ... }
+
+// Directories for persistent storage
+var HOME_DIR = process.env.HOME || '/home/humphrjk';
+var SESSIONS_DIR = path.join(HOME_DIR, 'goose-web', 'sessions');
+var UPLOADS_DIR = path.join(HOME_DIR, 'goose-web', 'uploads');
+
+// Create directories if they don't exist
+try { fs.mkdirSync(SESSIONS_DIR, { recursive: true }); } catch(e) {}
+try { fs.mkdirSync(UPLOADS_DIR, { recursive: true }); } catch(e) {}
+
+// Load saved sessions from disk on startup
+function loadSavedSessions() {
+  try {
+    var files = fs.readdirSync(SESSIONS_DIR);
+    var count = 0;
+    files.forEach(function(file) {
+      if (!file.endsWith('.json')) return;
+      try {
+        var data = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, file), 'utf8'));
+        if (data.id) {
+          savedSessions[data.id] = data;
+          count++;
+        }
+      } catch(e) { /* skip corrupt files */ }
+    });
+    console.log('[Sessions] Loaded ' + count + ' saved sessions from disk');
+  } catch(e) {
+    console.log('[Sessions] No saved sessions directory yet');
+  }
+}
+loadSavedSessions();
+
+// Save a session to disk
+function saveSessionToDisk(sessionId) {
+  var saved = savedSessions[sessionId];
+  if (!saved) return;
+  try {
+    var filePath = path.join(SESSIONS_DIR, sessionId + '.json');
+    fs.writeFileSync(filePath, JSON.stringify(saved, null, 2));
+  } catch(e) {
+    console.error('[Sessions] Failed to save session ' + sessionId + ':', e.message);
+  }
+}
 
 function generateSessionId() {
   var now = new Date();
@@ -325,21 +402,50 @@ function generateSessionId() {
   return y + mo + d + '_' + h + mi + s + '_' + (++sessionCounter);
 }
 
-function makeSession(id) {
+function makeSession(id, includeMessages) {
+  var saved = savedSessions[id];
   var now = new Date().toISOString();
-  return {
+  var session = {
     id: id,
-    working_dir: '/home/humphrjk/goose-web',
-    name: id,
-    created_at: now,
-    updated_at: now,
+    working_dir: HOME_DIR + '/goose-web',
+    name: (saved && saved.name) || id,
+    created_at: (saved && saved.created_at) || now,
+    updated_at: (saved && saved.updated_at) || now,
     extension_data: {},
-    message_count: 0,
+    message_count: (saved && saved.messages) ? saved.messages.length : 0,
     accumulated_input_tokens: 0,
     accumulated_output_tokens: 0,
     provider: 'claude-code',
     model: 'opus[1m]',
   };
+  if (includeMessages && saved && saved.messages) {
+    session.messages = saved.messages;
+  }
+  return session;
+}
+
+// Ensure a saved session entry exists for a session ID
+function ensureSavedSession(sessionId) {
+  if (!savedSessions[sessionId]) {
+    var now = new Date().toISOString();
+    savedSessions[sessionId] = {
+      id: sessionId,
+      name: sessionId,
+      created_at: now,
+      updated_at: now,
+      messages: [],
+    };
+  }
+  return savedSessions[sessionId];
+}
+
+// Add a message to saved session and persist
+function addMessageToSession(sessionId, message) {
+  var saved = ensureSavedSession(sessionId);
+  saved.messages.push(message);
+  saved.updated_at = new Date().toISOString();
+  saved.message_count = saved.messages.length;
+  saveSessionToDisk(sessionId);
 }
 
 var messageIdCounter = 0;
@@ -567,6 +673,11 @@ function handleAgentEndpoint(req, res, urlPath) {
       // Stable message ID for this response — frontend uses this to append
       // content to the same message bubble instead of creating new ones
       var assistantMsgId = 'msg_' + Date.now() + '_' + (++messageIdCounter);
+      var accumulatedText = ''; // For saving full response to history
+
+      // Save user message to history
+      var userMsgObj = makeMessage('user', userMessage);
+      addMessageToSession(sessionId, userMsgObj);
 
       function sendSSE(eventType, data) {
         if (finished && eventType !== 'close') return;
@@ -582,6 +693,7 @@ function handleAgentEndpoint(req, res, urlPath) {
 
         switch (msg.type) {
           case 'response':
+            accumulatedText += (msg.content || '');
             // Send delta chunk with stable ID — frontend appends to same message
             sendSSE('message', {
               type: 'Message',
@@ -635,6 +747,10 @@ function handleAgentEndpoint(req, res, urlPath) {
             break;
 
           case 'complete':
+            // Save accumulated assistant response to history
+            if (accumulatedText) {
+              addMessageToSession(sessionId, makeMessage('assistant', accumulatedText, assistantMsgId));
+            }
             sendSSE('message', {
               type: 'Finish',
               reason: 'complete',
@@ -785,33 +901,69 @@ function handleAgentEndpoint(req, res, urlPath) {
 function handleSessionEndpoint(req, res, urlPath) {
   // GET /sessions/list or /sessions — return SessionListResponse format
   if (req.method === 'GET' && (urlPath === '/sessions' || urlPath === '/sessions/list')) {
-    // Return active sessions as proper SessionListResponse
-    var sessionList = [];
-    Object.keys(activeSessions).forEach(function(sid) {
-      sessionList.push(makeSession(sid));
+    // Merge active sessions + saved sessions (saved ones may not be active)
+    var allSessionIds = {};
+    Object.keys(activeSessions).forEach(function(sid) { allSessionIds[sid] = true; });
+    Object.keys(savedSessions).forEach(function(sid) { allSessionIds[sid] = true; });
+    var sessionList = Object.keys(allSessionIds).map(function(sid) {
+      return makeSession(sid);
+    });
+    // Sort by updated_at descending (most recent first)
+    sessionList.sort(function(a, b) {
+      return new Date(b.updated_at) - new Date(a.updated_at);
     });
     jsonResponse(res, { sessions: sessionList });
     return true;
   }
   // GET /sessions/insights
   if (req.method === 'GET' && urlPath === '/sessions/insights') {
-    jsonResponse(res, { totalSessions: Object.keys(activeSessions).length, totalTokens: 0 });
+    var totalSessions = Object.keys(activeSessions).length + Object.keys(savedSessions).length;
+    jsonResponse(res, { totalSessions: totalSessions, totalTokens: 0 });
     return true;
   }
   // POST /sessions/search
   if (req.method === 'POST' && urlPath === '/sessions/search') {
-    readBody(req, function() { jsonResponse(res, { sessions: [] }); });
+    readBody(req, function(body) {
+      try {
+        var parsed = JSON.parse(body);
+        var query = (parsed.query || '').toLowerCase();
+        var results = [];
+        Object.keys(savedSessions).forEach(function(sid) {
+          var saved = savedSessions[sid];
+          var nameMatch = (saved.name || '').toLowerCase().indexOf(query) >= 0;
+          var msgMatch = (saved.messages || []).some(function(m) {
+            return m.content && m.content.some(function(c) {
+              return c.text && c.text.toLowerCase().indexOf(query) >= 0;
+            });
+          });
+          if (nameMatch || msgMatch) results.push(makeSession(sid));
+        });
+        jsonResponse(res, { sessions: results });
+      } catch(e) { jsonResponse(res, { sessions: [] }); }
+    });
     return true;
   }
-  // GET /sessions/:id
+  // GET /sessions/:id — return session with messages
   if (req.method === 'GET' && urlPath.match(/^\/sessions\/[^/]+$/)) {
     var sid = urlPath.split('/')[2];
-    jsonResponse(res, makeSession(sid));
+    jsonResponse(res, makeSession(sid, true));
     return true;
   }
-  // PUT /sessions/:id/name — rename session
+  // PUT /sessions/:id/name — rename session (persist)
   if (req.method === 'PUT' && urlPath.match(/^\/sessions\/[^/]+\/name$/)) {
-    readBody(req, function() { jsonResponse(res, { success: true }); });
+    var renameSid = urlPath.split('/')[2];
+    readBody(req, function(body) {
+      try {
+        var parsed = JSON.parse(body);
+        var newName = parsed.name || parsed.title || renameSid;
+        var saved = ensureSavedSession(renameSid);
+        saved.name = newName;
+        saved.updated_at = new Date().toISOString();
+        saveSessionToDisk(renameSid);
+        console.log('[Sessions] Renamed ' + renameSid + ' to "' + newName + '"');
+      } catch(e) {}
+      jsonResponse(res, { success: true });
+    });
     return true;
   }
   // DELETE /sessions/:id
@@ -820,6 +972,10 @@ function handleSessionEndpoint(req, res, urlPath) {
     if (activeSessions[delSid]) {
       if (activeSessions[delSid].ws) activeSessions[delSid].ws.close();
       delete activeSessions[delSid];
+    }
+    if (savedSessions[delSid]) {
+      delete savedSessions[delSid];
+      try { fs.unlinkSync(path.join(SESSIONS_DIR, delSid + '.json')); } catch(e) {}
     }
     jsonResponse(res, { success: true });
     return true;
@@ -1041,6 +1197,137 @@ function handleDictationEndpoint(req, res, urlPath) {
 }
 
 // ===========================================================================
+// File upload endpoint
+// ===========================================================================
+
+function handleUploadEndpoint(req, res, urlPath) {
+  // CORS preflight
+  if (req.method === 'OPTIONS' && (urlPath === '/upload' || urlPath.startsWith('/uploads'))) {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, X-Secret-Key, x-secret-key',
+    });
+    res.end();
+    return true;
+  }
+
+  // POST /upload — accept base64 file, save to server, return path
+  if (req.method === 'POST' && urlPath === '/upload') {
+    readBody(req, function(body) {
+      try {
+        var parsed = JSON.parse(body);
+        if (!parsed.data || !parsed.name) {
+          jsonResponse(res, { error: 'Missing name or data' }, 400);
+          return;
+        }
+        // Sanitize filename (remove path separators and dangerous chars)
+        var safeName = parsed.name.replace(/[/\\:*?"<>|]/g, '_');
+        var fileName = Date.now() + '_' + safeName;
+        var filePath = path.join(UPLOADS_DIR, fileName);
+        var buffer = Buffer.from(parsed.data, 'base64');
+        fs.writeFileSync(filePath, buffer);
+        var sizeKB = (buffer.length / 1024).toFixed(1);
+        console.log('[Upload] Saved ' + safeName + ' (' + sizeKB + 'KB) -> ' + filePath);
+        jsonResponse(res, { path: filePath, name: safeName, size: buffer.length });
+      } catch(e) {
+        console.error('[Upload] Error:', e);
+        jsonResponse(res, { error: 'Upload failed' }, 500);
+      }
+    });
+    return true;
+  }
+
+  // GET /uploads/* — serve uploaded files
+  if (req.method === 'GET' && urlPath.startsWith('/uploads/')) {
+    var fileName = urlPath.substring('/uploads/'.length);
+    var filePath = path.join(UPLOADS_DIR, fileName);
+    // Prevent directory traversal
+    if (filePath.indexOf(UPLOADS_DIR) !== 0) {
+      res.writeHead(403); res.end('Forbidden');
+      return true;
+    }
+    if (fs.existsSync(filePath)) {
+      var ext = path.extname(filePath);
+      var contentType = MIME[ext] || 'application/octet-stream';
+      fs.readFile(filePath, function(err, data) {
+        if (err) { res.writeHead(500); res.end('Error'); return; }
+        res.writeHead(200, { 'Content-Type': contentType, 'Access-Control-Allow-Origin': '*' });
+        res.end(data);
+      });
+    } else {
+      res.writeHead(404); res.end('Not Found');
+    }
+    return true;
+  }
+
+  return false;
+}
+
+// ===========================================================================
+// File browser endpoint
+// ===========================================================================
+
+function handleBrowseEndpoint(req, res, urlPath) {
+  if (req.method === 'OPTIONS' && urlPath === '/browse') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, X-Secret-Key, x-secret-key',
+    });
+    res.end();
+    return true;
+  }
+
+  if (req.method === 'GET' && urlPath === '/browse') {
+    var queryString = req.url.split('?')[1] || '';
+    var params = {};
+    queryString.split('&').forEach(function(pair) {
+      var kv = pair.split('=');
+      if (kv[0]) params[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1] || '');
+    });
+
+    var browsePath = params.path || HOME_DIR;
+    // Security: restrict to home directory
+    var resolved = path.resolve(browsePath);
+    if (resolved.indexOf(HOME_DIR) !== 0 && resolved.indexOf('/tmp') !== 0) {
+      jsonResponse(res, { error: 'Access denied: path must be under home directory', entries: [] }, 403);
+      return true;
+    }
+
+    try {
+      var entries = fs.readdirSync(resolved).map(function(name) {
+        try {
+          var fullPath = path.join(resolved, name);
+          var stat = fs.statSync(fullPath);
+          return {
+            name: name,
+            path: fullPath,
+            type: stat.isDirectory() ? 'directory' : 'file',
+            size: stat.size,
+            modified: stat.mtime.toISOString(),
+          };
+        } catch(e) {
+          return { name: name, path: path.join(resolved, name), type: 'unknown', size: 0, modified: '' };
+        }
+      });
+      // Sort: directories first, then alphabetically
+      entries.sort(function(a, b) {
+        if (a.type === 'directory' && b.type !== 'directory') return -1;
+        if (a.type !== 'directory' && b.type === 'directory') return 1;
+        return a.name.localeCompare(b.name);
+      });
+      jsonResponse(res, { path: resolved, parent: path.dirname(resolved), entries: entries });
+    } catch(e) {
+      jsonResponse(res, { error: 'Cannot read directory: ' + e.message, entries: [] }, 400);
+    }
+    return true;
+  }
+
+  return false;
+}
+
+// ===========================================================================
 // Static files + proxy
 // ===========================================================================
 
@@ -1108,6 +1395,16 @@ var server = http.createServer(function(req, res) {
   // Intercept dictation endpoints
   if (urlPath.startsWith('/dictation')) {
     if (handleDictationEndpoint(req, res, urlPath)) return;
+  }
+
+  // File upload
+  if (urlPath === '/upload' || urlPath.startsWith('/uploads')) {
+    if (handleUploadEndpoint(req, res, urlPath)) return;
+  }
+
+  // File browser
+  if (urlPath === '/browse') {
+    if (handleBrowseEndpoint(req, res, urlPath)) return;
   }
 
   // CORS preflight for /reply
