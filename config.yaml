@@ -1,0 +1,316 @@
+extensions:
+  todo:
+    enabled: true
+    type: platform
+    name: todo
+    description: Enable a todo list for goose so it can keep track of what it is doing
+    display_name: Todo
+    bundled: true
+    available_tools: []
+  extensionmanager:
+    enabled: true
+    type: platform
+    name: Extension Manager
+    description: Enable extension management tools for discovering, enabling, and disabling extensions
+    display_name: Extension Manager
+    bundled: true
+    available_tools: []
+  tom:
+    enabled: true
+    type: platform
+    name: tom
+    description: Inject custom context into every turn via GOOSE_MOIM_MESSAGE_TEXT and GOOSE_MOIM_MESSAGE_FILE environment variables
+    display_name: Top Of Mind
+    bundled: true
+    available_tools: []
+  code_execution:
+    enabled: true
+    type: platform
+    name: code_execution
+    description: Goose will make extension calls through code execution, saving tokens
+    display_name: Code Mode
+    bundled: true
+    available_tools: []
+  apps:
+    enabled: true
+    type: platform
+    name: apps
+    description: Create and manage custom Goose apps through chat. Apps are HTML/CSS/JavaScript and run in sandboxed windows.
+    display_name: Apps
+    bundled: true
+    available_tools: []
+  chatrecall:
+    enabled: true
+    type: platform
+    name: chatrecall
+    description: Search past conversations and load session summaries for contextual memory
+    display_name: Chat Recall
+    bundled: true
+    available_tools: []
+  summon:
+    enabled: true
+    type: platform
+    name: summon
+    description: Load knowledge and delegate tasks to subagents
+    display_name: Summon
+    bundled: true
+    available_tools: []
+  developer:
+    enabled: true
+    type: builtin
+    name: developer
+    description: General development tools useful for software engineering.
+    display_name: Developer
+    timeout: 300
+    bundled: true
+    available_tools: []
+  computercontroller:
+    enabled: true
+    type: builtin
+    name: computercontroller
+    description: General computer control tools that don't require you to be a developer or engineer.
+    display_name: Computer Controller
+    timeout: 300
+    bundled: true
+    available_tools: []
+  autovisualiser:
+    enabled: true
+    type: builtin
+    name: autovisualiser
+    description: Data visualization and UI generation tools
+    display_name: Auto Visualiser
+    timeout: 300
+    bundled: true
+    available_tools: []
+  memory:
+    enabled: true
+    type: builtin
+    name: memory
+    description: Teach goose your preferences as you go.
+    display_name: Memory
+    timeout: 300
+    bundled: true
+    available_tools: []
+  tutorial:
+    enabled: true
+    type: builtin
+    name: tutorial
+    description: Access interactive tutorials and guides
+    display_name: Tutorial
+    timeout: 300
+    bundled: true
+    available_tools: []
+  filesystem:
+    enabled: true
+    type: stdio
+    name: Filesystem
+    description: File system operations and management
+    cmd: /home/humphrjk/.nvm/versions/node/v22.22.0/bin/npx
+    args:
+    - -y
+    - '@modelcontextprotocol/server-filesystem'
+    - /home/humphrjk
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  councilofmine:
+    enabled: true
+    type: stdio
+    name: Council of Mine
+    description: LLM council debate with 9 distinct personas for decision-making
+    cmd: /home/humphrjk/.local/bin/uvx
+    args:
+    - --from
+    - git+https://github.com/block/mcp-council-of-mine
+    - mcp_council_of_mine
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  fetch:
+    enabled: true
+    type: stdio
+    name: Fetch
+    description: Web content fetching and conversion to markdown
+    display_name: Fetch
+    cmd: /home/humphrjk/.local/bin/uvx
+    args:
+    - mcp-server-fetch
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  pdfreader:
+    enabled: true
+    type: stdio
+    name: PDF Reader
+    description: Read large and complex PDF documents
+    display_name: PDF Reader
+    cmd: /home/humphrjk/.local/bin/uvx
+    args:
+    - mcp-read-pdf
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  youtube_transcript:
+    enabled: true
+    type: stdio
+    name: YouTube Transcript
+    description: Extract video transcripts from YouTube
+    display_name: YouTube Transcript
+    cmd: /home/humphrjk/.local/bin/uvx
+    args:
+    - --from
+    - git+https://github.com/jkawamoto/mcp-youtube-transcript
+    - mcp-youtube-transcript
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  context7:
+    enabled: true
+    type: stdio
+    name: Context7
+    description: Access up-to-date code documentation and examples for any library
+    display_name: Context7
+    cmd: /home/humphrjk/.nvm/versions/node/v22.22.0/bin/npx
+    args:
+    - -y
+    - '@upstash/context7-mcp'
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  repomix:
+    enabled: true
+    type: stdio
+    name: Repomix
+    description: Repository analysis and code organization into single files
+    display_name: Repomix
+    cmd: /home/humphrjk/.nvm/versions/node/v22.22.0/bin/npx
+    args:
+    - -y
+    - repomix-mcp
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  knowledgegraph:
+    enabled: true
+    type: stdio
+    name: Knowledge Graph Memory
+    description: Graph-based memory system for persistent knowledge storage
+    display_name: Knowledge Graph Memory
+    cmd: /home/humphrjk/.nvm/versions/node/v22.22.0/bin/npx
+    args:
+    - -y
+    - '@modelcontextprotocol/server-memory'
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  beads:
+    enabled: true
+    type: stdio
+    name: Beads
+    description: Git-backed issue tracker for AI agent task management
+    display_name: Beads
+    cmd: /home/humphrjk/.local/bin/uvx
+    args:
+    - beads-mcp
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  promptschat:
+    enabled: true
+    type: stdio
+    name: prompts.chat
+    description: Access thousands of curated AI prompts
+    display_name: prompts.chat
+    cmd: /home/humphrjk/.nvm/versions/node/v22.22.0/bin/npx
+    args:
+    - -y
+    - '@fkadev/prompts.chat-mcp@latest'
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  excalidraw:
+    enabled: true
+    type: streamable_http
+    name: Excalidraw
+    description: Diagramming and visual collaboration
+    display_name: Excalidraw
+    uri: https://excalidraw-mcp-app.vercel.app/mcp
+    envs: {}
+    env_keys: []
+    headers: {}
+    timeout: 300
+    bundled: null
+    available_tools: []
+  goosedocs:
+    enabled: true
+    type: stdio
+    name: Goose Docs
+    description: Access Goose documentation via GitMCP
+    display_name: Goose Docs
+    cmd: /home/humphrjk/.nvm/versions/node/v22.22.0/bin/npx
+    args:
+    - -y
+    - mcp-remote
+    - https://block.gitmcp.io/goose/
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  containeruse:
+    enabled: true
+    type: stdio
+    name: Container Use
+    description: Container workflows and Docker integration
+    display_name: Container Use
+    cmd: /home/humphrjk/.nvm/versions/node/v22.22.0/bin/npx
+    args:
+    - -y
+    - mcp-remote
+    - https://container-use.com/mcp
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  playwright:
+    enabled: true
+    type: stdio
+    name: Playwright
+    description: Browser automation and web interaction via accessibility snapshots
+    display_name: Playwright
+    cmd: /home/humphrjk/.nvm/versions/node/v22.22.0/bin/npx
+    args:
+    - -y
+    - '@playwright/mcp@latest'
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+GOOSE_TELEMETRY_ENABLED: true
+GOOSE_PROVIDER: claude-code
+GOOSE_MODEL: 'opus[1m]'
+CLAUDE_CODE_COMMAND: /home/humphrjk/.nvm/versions/node/v22.22.0/bin/claude
+GOOSE_MAX_TURNS: 5000
+SECURITY_PROMPT_ENABLED: true
