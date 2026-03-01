@@ -693,12 +693,19 @@ function handleAgentEndpoint(req, res, urlPath) {
   // SSE stream helper (extracted for async session creation)
   function startSSEStream(session, sessionId, userMessage, req, res) {
       // Set up SSE response
+      // Disable Nagle's algorithm and socket buffering for instant SSE delivery
+      if (req.socket) {
+        req.socket.setNoDelay(true);
+        req.socket.setTimeout(0);
+      }
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',  // Disable nginx/proxy buffering
         'Access-Control-Allow-Origin': '*',
       });
+      res.flushHeaders();  // Send headers immediately
 
       var finished = false;
       // Stable message ID for this response — frontend uses this to append
@@ -712,8 +719,8 @@ function handleAgentEndpoint(req, res, urlPath) {
 
       function sendSSE(eventType, data) {
         if (finished && eventType !== 'close') return;
-        res.write('event: ' + eventType + '\n');
-        res.write('data: ' + JSON.stringify(data) + '\n\n');
+        // Single write + explicit flush for minimal latency
+        res.write('event: ' + eventType + '\ndata: ' + JSON.stringify(data) + '\n\n');
       }
 
       // Listen for WebSocket messages from goosed
