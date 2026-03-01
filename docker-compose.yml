@@ -1,0 +1,13 @@
+services:
+  goose-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: goose-web
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      - GOOSED_HOST=host.docker.internal
+      - GOOSED_PORT=3002
+      - SECRET=goose-web-access
