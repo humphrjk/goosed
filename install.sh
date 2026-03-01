@@ -2,44 +2,141 @@
 set -euo pipefail
 
 # ============================================================
-# Goose Web — Install Script
-# Sets up the full Goose desktop UI as a web app on a Linux
-# ARM64 machine (e.g., NVIDIA DGX Spark) with Tailscale Funnel.
+# Goose Web — Deploy Script
 #
-# Prerequisites:
-#   - Ubuntu 24.04+ ARM64
-#   - Tailscale installed and logged in
-#   - Internet access
-#   - Frontend assets tarball: goose-frontend.tar.gz
-#     (create with: tar czf goose-frontend.tar.gz -C frontend .)
+# Deploys the full Goose desktop UI as a web app on a Linux
+# machine with Tailscale Funnel, voice dictation, and 26
+# extensions.
 #
-# What this does NOT install:
-#   - SSH keys or credentials
-#   - API keys or auth tokens
-#   - Tailscale login (must be done separately)
+# Supports: Ubuntu 22.04+ on ARM64 (DGX Spark) and x86_64
 #
 # Usage:
-#   chmod +x install.sh
-#   ./install.sh [--frontend-tarball /path/to/goose-frontend.tar.gz]
+#   ./install.sh <frontend-tarball>
+#   ./install.sh goose-frontend.tar.gz
+#
+# The frontend tarball contains the Goose Electron app's
+# React/Vite build output. Create it on a machine where the
+# Goose desktop app has been run at least once:
+#   ./package-frontend.sh
+#
+# What this script installs:
+#   - nvm + Node.js 22
+#   - uv / uvx (Python package manager)
+#   - Goose CLI (latest release)
+#   - Claude CLI (via npm)
+#   - OpenAI Whisper (via uv tool, for voice dictation)
+#   - ffmpeg (via apt, for audio processing)
+#   - serve.js, whisper_server.py, start.sh
+#   - config.yaml template with 26 extensions
+#
+# What this script does NOT install:
+#   - Tailscale (must be installed and logged in already)
+#   - API keys, SSH keys, or credentials
+#   - Claude CLI login (run 'claude login' after install)
 # ============================================================
 
-GOOSE_VERSION="1.26.1"
+GOOSE_VERSION="latest"
 NODE_VERSION="22"
 INSTALL_DIR="$HOME/goose-web"
 CONFIG_DIR="$HOME/.config/goose"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 FRONTEND_TARBALL="${1:-}"
 
-echo "============================================"
-echo "  Goose Web — Installation"
-echo "============================================"
+# ── Colors ────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+info()  { echo -e "${BLUE}[INFO]${NC}  $*"; }
+ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+err()   { echo -e "${RED}[ERROR]${NC} $*"; }
+step()  { echo -e "\n${GREEN}━━━ $* ━━━${NC}"; }
+
+# ── Pre-flight checks ────────────────────────────
+echo ""
+echo "╔════════════════════════════════════════════╗"
+echo "║       Goose Web — Deployment Script        ║"
+echo "╚════════════════════════════════════════════╝"
 echo ""
 
-# ── Check architecture ──────────────────────────
 ARCH=$(uname -m)
 if [ "$ARCH" != "aarch64" ] && [ "$ARCH" != "x86_64" ]; then
-    echo "ERROR: Unsupported architecture: $ARCH"
-    echo "       This script supports aarch64 and x86_64."
+    err "Unsupported architecture: $ARCH (need aarch64 or x86_64)"
     exit 1
+fi
+info "Architecture: $ARCH"
+info "Install dir:  $INSTALL_DIR"
+
+if [ -z "$FRONTEND_TARBALL" ]; then
+    warn "No frontend tarball specified."
+    warn "Usage: $0 <path-to-goose-frontend.tar.gz>"
+    warn "Create it with: ./package-frontend.sh"
+    warn "Continuing without frontend (you can add it later)."
+    echo ""
+elif [ ! -f "$FRONTEND_TARBALL" ]; then
+    err "Frontend tarball not found: $FRONTEND_TARBALL"
+    exit 1
+fi
+
+# Check for Tailscale
+if ! command -v tailscale &>/dev/null; then
+    warn "Tailscale not found. Install it: https://tailscale.com/download/linux"
+    warn "Continuing without Tailscale (no HTTPS URL will be set up)."
+fi
+
+# ── Create directories ────────────────────────────
+step "1/9 — Creating directories"
+mkdir -p "$INSTALL_DIR"
+mkdir -p "$CONFIG_DIR"
+ok "Directories created"
+
+# ── Install nvm + Node.js ─────────────────────────
+step "2/9 — Node.js $NODE_VERSION (via nvm)"
+if [ ! -d "$HOME/.nvm" ]; then
+    info "Installing nvm..."
+    curl -so- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+fi
+export NVM_DIR="$HOME/.nvm"
+# shellcheck source=/dev/null
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+if ! node --version &>/dev/null || [[ "$(node --version)" != v${NODE_VERSION}* ]]; then
+    info "Installing Node.js $NODE_VERSION..."
+    nvm install "$NODE_VERSION"
+fi
+nvm use "$NODE_VERSION" >/dev/null
+NODE_BIN_DIR="$(dirname "$(which node)")"
+NPX_PATH="$NODE_BIN_DIR/npx"
+ok "Node.js $(node --version) at $NODE_BIN_DIR"
+
+# ── Install uv/uvx ───────────────────────────────
+step "3/9 — uv / uvx (Python package manager)"
+if ! command -v uv &>/dev/null && [ ! -f "$HOME/.local/bin/uv" ]; then
+    info "Installing uv..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+fi
+UVX_PATH="$HOME/.local/bin/uvx"
+ok "uv installed at $HOME/.local/bin/uv"
+
+# ── Install Claude CLI ────────────────────────────
+step "4/9 — Claude CLI"
+if ! command -v claude &>/dev/null; then
+    info "Installing Claude CLI..."
+    npm install -g @anthropic-ai/claude-code 2>&1 | tail -1
+fi
+CLAUDE_PATH=$(which claude 2>/dev/null || echo "$NODE_BIN_DIR/claude")
+ok "Claude CLI at $CLAUDE_PATH"
+
+# ── Download Goose CLI ────────────────────────────
+step "5/9 — Goose CLI"
+cd "$INSTALL_DIR"
+
+if [ "$GOOSE_VERSION" = "latest" ]; then
+    info "Fetching latest Goose release..."
+    GOOSE_VERSION=$(curl -sI https://github.com/block/goose/releases/latest | grep -i '^location:' | grep -oP 'v\K[0-9.]+' || echo "1.26.1")
+    info "Latest version: v$GOOSE_VERSION"
 fi
 
 if [ "$ARCH" = "aarch64" ]; then
@@ -48,288 +145,134 @@ else
     GOOSE_ARCHIVE="goose-x86_64-unknown-linux-gnu.tar.bz2"
 fi
 
-# ── Create directories ──────────────────────────
-echo "[1/8] Creating directories..."
-mkdir -p "$INSTALL_DIR"
-mkdir -p "$CONFIG_DIR"
-
-# ── Install nvm + Node.js ───────────────────────
-echo "[2/8] Installing nvm + Node.js $NODE_VERSION..."
-if [ ! -d "$HOME/.nvm" ]; then
-    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
-fi
-export NVM_DIR="$HOME/.nvm"
-# shellcheck source=/dev/null
-[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-nvm install "$NODE_VERSION"
-nvm use "$NODE_VERSION"
-echo "  Node.js $(node --version) installed"
-
-# ── Install uv/uvx ─────────────────────────────
-echo "[3/8] Installing uv/uvx..."
-if ! command -v uvx &>/dev/null && [ ! -f "$HOME/.local/bin/uvx" ]; then
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-fi
-echo "  uvx installed at $HOME/.local/bin/uvx"
-
-# ── Install Claude CLI ──────────────────────────
-echo "[4/8] Installing Claude CLI..."
-npm install -g @anthropic-ai/claude-code
-CLAUDE_PATH=$(which claude || echo "$NVM_DIR/versions/node/v$(node --version | tr -d v)/bin/claude")
-echo "  Claude CLI installed at $CLAUDE_PATH"
-
-# ── Download Goose CLI ──────────────────────────
-echo "[5/8] Downloading Goose CLI v$GOOSE_VERSION ($ARCH)..."
-cd "$INSTALL_DIR"
 if [ ! -f goose ] || [ "$(./goose --version 2>/dev/null | awk '{print $2}')" != "$GOOSE_VERSION" ]; then
+    info "Downloading Goose v$GOOSE_VERSION for $ARCH..."
     curl -L -o goose.tar.bz2 "https://github.com/block/goose/releases/download/v$GOOSE_VERSION/$GOOSE_ARCHIVE"
     tar xjf goose.tar.bz2
     rm -f goose.tar.bz2
     chmod +x goose
 fi
-echo "  Goose $(./goose --version) installed"
+ok "Goose CLI $(./goose --version 2>/dev/null || echo "v$GOOSE_VERSION")"
 
-# ── Extract frontend assets ─────────────────────
-echo "[6/8] Setting up frontend assets..."
+# ── Install Whisper + ffmpeg ──────────────────────
+step "6/9 — Whisper (voice dictation)"
+
+# ffmpeg is required by whisper for audio format conversion
+if ! command -v ffmpeg &>/dev/null; then
+    info "Installing ffmpeg..."
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg 2>&1 | tail -1
+    else
+        warn "Could not install ffmpeg (no apt-get). Install manually."
+    fi
+fi
+
+WHISPER_PYTHON="$HOME/.local/share/uv/tools/openai-whisper/bin/python3"
+if [ ! -x "$WHISPER_PYTHON" ]; then
+    info "Installing openai-whisper via uv tool..."
+    "$HOME/.local/bin/uv" tool install openai-whisper 2>&1 | tail -3
+fi
+
+if [ -x "$WHISPER_PYTHON" ]; then
+    info "Pre-downloading whisper base model..."
+    "$WHISPER_PYTHON" -c "import whisper; whisper.load_model('base'); print('Model ready')" 2>&1 | tail -1
+    ok "Whisper installed with base model"
+else
+    warn "Whisper installation failed. Voice dictation will not work."
+fi
+
+# ── Extract frontend assets ──────────────────────
+step "7/9 — Frontend assets"
 if [ -n "$FRONTEND_TARBALL" ] && [ -f "$FRONTEND_TARBALL" ]; then
     mkdir -p "$INSTALL_DIR/frontend"
     tar xzf "$FRONTEND_TARBALL" -C "$INSTALL_DIR/frontend"
-    echo "  Frontend extracted from $FRONTEND_TARBALL"
+    ok "Frontend extracted from $FRONTEND_TARBALL"
 elif [ -d "$INSTALL_DIR/frontend" ] && [ -f "$INSTALL_DIR/frontend/index.html" ]; then
-    echo "  Frontend assets already present"
+    ok "Frontend assets already present"
 else
-    echo "  WARNING: No frontend assets found!"
-    echo "  Copy the Goose Electron app's frontend to $INSTALL_DIR/frontend/"
-    echo "  On Windows: %TEMP%\\goose-app\\.vite\\renderer\\main_window\\"
-    echo "  Or provide --frontend-tarball /path/to/goose-frontend.tar.gz"
+    warn "No frontend assets found!"
+    warn "Copy from a machine with the Goose desktop app:"
+    warn "  1. Run the Goose desktop app at least once"
+    warn "  2. Run: ./package-frontend.sh"
+    warn "  3. Copy the tarball here and run: tar xzf goose-frontend.tar.gz -C $INSTALL_DIR/frontend/"
 fi
 
-# ── Create serve.js ─────────────────────────────
-echo "[7/8] Creating serve.js..."
-NODE_BIN_DIR=$(dirname "$(which node)")
-NPX_PATH="$NODE_BIN_DIR/npx"
+# ── Deploy application files ─────────────────────
+step "8/9 — Application files"
 
-cat > "$INSTALL_DIR/serve.js" << 'SERVEJS'
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
+# Copy serve.js, whisper_server.py from the repo
+for f in serve.js whisper_server.py; do
+    if [ -f "$SCRIPT_DIR/$f" ]; then
+        cp "$SCRIPT_DIR/$f" "$INSTALL_DIR/$f"
+        ok "Copied $f"
+    else
+        warn "$f not found in $SCRIPT_DIR"
+    fi
+done
 
-const STATIC_DIR = process.env.STATIC_DIR || path.join(__dirname, 'frontend');
-const PORT = parseInt(process.env.PORT || '3001');
-const GOOSED_HOST = process.env.GOOSED_HOST || '127.0.0.1';
-const GOOSED_PORT = parseInt(process.env.GOOSED_PORT || '3010');
-const SECRET = process.env.SECRET || 'goose-web-access';
-
-const STATIC_EXT = new Set(['.html', '.js', '.css', '.json', '.png', '.svg', '.ico',
-  '.woff', '.woff2', '.ttf', '.mp3', '.wav', '.map']);
-
-const MIME = {
-  '.html': 'text/html', '.js': 'application/javascript', '.css': 'text/css',
-  '.json': 'application/json', '.png': 'image/png', '.svg': 'image/svg+xml',
-  '.ico': 'image/x-icon', '.woff': 'font/woff', '.woff2': 'font/woff2',
-  '.ttf': 'font/ttf', '.mp3': 'audio/mpeg', '.wav': 'audio/wav',
-};
-
-const SHIM = `<script>
-  const noopAsync = () => Promise.resolve(null);
-  const config = {
-    GOOSE_API_HOST: location.hostname,
-    GOOSE_PORT: '${PORT}',
-    GOOSE_SECRET_KEY: '${SECRET}',
-    GOOSE_VERSION: '1.26.1',
-    WS_PORT: '${PORT}',
-  };
-  window.appConfig = { get: (k) => config[k], getAll: () => config };
-  window.electron = {
-    platform: 'linux',
-    getConfig: () => config,
-    getSecretKey: () => Promise.resolve('${SECRET}'),
-    getGoosedHostPort: () => Promise.resolve(location.origin),
-    reactReady: () => {},
-    hideWindow: () => {},
-    directoryChooser: noopAsync,
-    createChatWindow: () => {},
-    logInfo: (msg) => console.log('[goose]', msg),
-    showNotification: (msg) => { if (Notification.permission === 'granted') new Notification(msg.title || 'Goose', { body: msg.body }); },
-    showMessageBox: noopAsync,
-    showSaveDialog: noopAsync,
-    openInChrome: (url) => window.open(url, '_blank'),
-    fetchMetadata: noopAsync,
-    reloadApp: () => location.reload(),
-    checkForOllama: () => Promise.resolve(false),
-    selectFileOrDirectory: noopAsync,
-    getBinaryPath: noopAsync,
-    readFile: noopAsync,
-    writeFile: noopAsync,
-    ensureDirectory: noopAsync,
-    listFiles: noopAsync,
-    getPathForFile: (f) => f?.name || '',
-    getAllowedExtensions: () => Promise.resolve([]),
-    setMenuBarIcon: noopAsync,
-    getMenuBarIconState: () => Promise.resolve(true),
-    setDockIcon: noopAsync,
-    getDockIconState: () => Promise.resolve(true),
-    getSetting: (k) => {
-      const defaults = { theme: 'dark', useSystemTheme: false, responseStyle: 'detailed', showPricing: true, sessionSharing: { enabled: false, baseUrl: '' }, seenAnnouncementIds: [] };
-      return Promise.resolve(defaults[k] ?? null);
-    },
-    setSetting: noopAsync,
-    setWakelock: noopAsync,
-    getWakelockState: () => Promise.resolve(false),
-    setSpellcheck: noopAsync,
-    getSpellcheckState: () => Promise.resolve(true),
-    openNotificationsSettings: noopAsync,
-    onMouseBackButtonClicked: () => () => {},
-    offMouseBackButtonClicked: () => {},
-    on: () => {},
-    off: () => {},
-    emit: () => {},
-    broadcastThemeChange: () => {},
-    openExternal: (url) => Promise.resolve(window.open(url, '_blank')),
-    getVersion: () => '1.26.1',
-    checkForUpdates: noopAsync,
-    downloadUpdate: noopAsync,
-    installUpdate: () => {},
-    restartApp: () => location.reload(),
-    onUpdaterEvent: () => {},
-    getUpdateState: noopAsync,
-    isUsingGitHubFallback: () => Promise.resolve(false),
-    closeWindow: () => {},
-    hasAcceptedRecipeBefore: () => Promise.resolve(false),
-    recordRecipeHash: noopAsync,
-    openDirectoryInExplorer: noopAsync,
-    launchApp: noopAsync,
-    refreshApp: noopAsync,
-    closeApp: noopAsync,
-    addRecentDir: noopAsync,
-  };
-</script>`;
-
-function isStaticFile(urlPath) {
-  const ext = path.extname(urlPath);
-  if (STATIC_EXT.has(ext)) return true;
-  const filePath = path.join(STATIC_DIR, urlPath);
-  return fs.existsSync(filePath);
-}
-
-function proxyToGoosed(req, res) {
-  const options = {
-    hostname: GOOSED_HOST,
-    port: GOOSED_PORT,
-    path: req.url,
-    method: req.method,
-    headers: { ...req.headers, 'x-secret-key': SECRET, host: GOOSED_HOST + ':' + GOOSED_PORT },
-  };
-  const proxyReq = http.request(options, (proxyRes) => {
-    const headers = { ...proxyRes.headers };
-    if (proxyRes.headers['content-type']?.includes('text/event-stream')) {
-      headers['cache-control'] = 'no-cache';
-      headers['connection'] = 'keep-alive';
-    }
-    res.writeHead(proxyRes.statusCode, headers);
-    proxyRes.pipe(res);
-  });
-  proxyReq.on('error', () => {
-    res.writeHead(502);
-    res.end('Bad Gateway - goosed not reachable');
-  });
-  req.pipe(proxyReq);
-}
-
-const server = http.createServer((req, res) => {
-  const urlPath = req.url.split('?')[0];
-  if (urlPath === '/' || urlPath === '/index.html') {
-    const filePath = path.join(STATIC_DIR, 'index.html');
-    fs.readFile(filePath, 'utf8', (err, html) => {
-      if (err) { res.writeHead(500); res.end('Error loading UI'); return; }
-      html = html.replace(/<meta http-equiv="Content-Security-Policy"[^>]*\/>/, '');
-      html = html.replace('</head>', SHIM + '</head>');
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(html);
-    });
-    return;
-  }
-  if (isStaticFile(urlPath)) {
-    const filePath = path.join(STATIC_DIR, urlPath);
-    if (fs.existsSync(filePath)) {
-      const ext = path.extname(filePath);
-      const contentType = MIME[ext] || 'application/octet-stream';
-      fs.readFile(filePath, (err, data) => {
-        if (err) { res.writeHead(404); res.end('Not Found'); return; }
-        res.writeHead(200, { 'Content-Type': contentType });
-        res.end(data);
-      });
-      return;
-    }
-  }
-  proxyToGoosed(req, res);
-});
-
-server.on('upgrade', (req, socket, head) => {
-  const options = {
-    hostname: GOOSED_HOST,
-    port: GOOSED_PORT,
-    path: req.url,
-    method: 'GET',
-    headers: { ...req.headers, 'x-secret-key': SECRET },
-  };
-  const proxyReq = http.request(options);
-  proxyReq.on('upgrade', (proxyRes, proxySocket, proxyHead) => {
-    socket.write('HTTP/1.1 101 Switching Protocols\r\n' +
-      Object.entries(proxyRes.headers).map(([k,v]) => `${k}: ${v}`).join('\r\n') +
-      '\r\n\r\n');
-    proxySocket.pipe(socket);
-    socket.pipe(proxySocket);
-  });
-  proxyReq.on('error', () => socket.destroy());
-  proxyReq.end();
-});
-
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Goose Web UI:   http://localhost:${PORT}`);
-  console.log(`Proxying API -> http://${GOOSED_HOST}:${GOOSED_PORT}`);
-});
-SERVEJS
-
-echo "  serve.js created"
-
-# ── Create start.sh ─────────────────────────────
-cat > "$INSTALL_DIR/start.sh" << STARTSH
+# Create start.sh
+cat > "$INSTALL_DIR/start.sh" << STARTEOF
 #!/bin/bash
-# Goose Web — Startup Script
+# Goose Web — Startup Script (generated by install.sh)
 export PATH=$NODE_BIN_DIR:\$HOME/.local/bin:\$PATH
 cd $INSTALL_DIR
 
 # Kill existing
-kill \\\$(netstat -tlnp 2>/dev/null | grep ':3010 ' | sed 's|.*LISTEN *||' | cut -d/ -f1) 2>/dev/null
-kill \\\$(netstat -tlnp 2>/dev/null | grep ':3001 ' | sed 's|.*LISTEN *||' | cut -d/ -f1) 2>/dev/null
+kill \$(netstat -tlnp 2>/dev/null | grep ':3010 ' | sed 's|.*LISTEN *||' | cut -d/ -f1) 2>/dev/null
+kill \$(netstat -tlnp 2>/dev/null | grep ':3001 ' | sed 's|.*LISTEN *||' | cut -d/ -f1) 2>/dev/null
+kill \$(netstat -tlnp 2>/dev/null | grep ':3012 ' | sed 's|.*LISTEN *||' | cut -d/ -f1) 2>/dev/null
 sleep 1
 
-# Start goosed backend (port 3010)
-nohup ./goose web --host 0.0.0.0 --port 3010 --no-auth > goosed.log 2>&1 &
-echo "[1/3] goosed started (port 3010)"
+# 1. Goose backend (port 3010)
+GOOSE_PROVIDER=claude-code GOOSE_MODEL='opus[1m]' CLAUDE_CODE_COMMAND=$CLAUDE_PATH GOOSE_MAX_TURNS=5000 nohup ./goose web --host 0.0.0.0 --port 3010 --no-auth > goosed.log 2>&1 &
+echo '[1/4] goosed started (port 3010)'
 sleep 4
 
-# Start serve.js frontend (port 3001)
-GOOSED_HOST=127.0.0.1 GOOSED_PORT=3010 nohup node serve.js > serve.log 2>&1 &
-echo "[2/3] serve.js started (port 3001)"
+# 2. Whisper transcription server (port 3012)
+WHISPER_PYTHON=$WHISPER_PYTHON
+if [ -x "\$WHISPER_PYTHON" ]; then
+  nohup "\$WHISPER_PYTHON" whisper_server.py --model base --port 3012 > whisper.log 2>&1 &
+  echo '[2/4] whisper server started (port 3012)'
+else
+  echo '[2/4] whisper server SKIPPED (not installed)'
+fi
+sleep 2
+
+# 3. Frontend + API shim (port 3001)
+GOOSED_HOST=127.0.0.1 GOOSED_PORT=3010 WHISPER_PORT=3012 nohup node serve.js > serve.log 2>&1 &
+echo '[3/4] serve.js started (port 3001)'
 sleep 1
 
-# Tailscale Funnel
-tailscale funnel --bg 3001 2>/dev/null
-echo "[3/3] Tailscale Funnel active"
-
-echo ""
-echo "=== Goose Web Running ==="
-echo "  Local:  http://localhost:3001"
-HOSTNAME=\$(tailscale status --self --json 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('Self',{}).get('DNSName','').rstrip('.'))" 2>/dev/null || echo "unknown")
-echo "  Remote: https://\$HOSTNAME"
-STARTSH
+# 4. Tailscale Funnel
+if command -v tailscale &>/dev/null; then
+  tailscale funnel --bg 3001 2>/dev/null
+  echo '[4/4] Tailscale Funnel active'
+  HOSTNAME=\$(tailscale status --self --json 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('Self',{}).get('DNSName','').rstrip('.'))" 2>/dev/null || echo "unknown")
+  echo ""
+  echo "=== Goose Web Running ==="
+  echo "  Local:  http://localhost:3001"
+  echo "  Remote: https://\$HOSTNAME"
+  echo "  Voice:  Whisper on port 3012"
+else
+  echo '[4/4] Tailscale not found — no HTTPS URL'
+  echo ""
+  echo "=== Goose Web Running ==="
+  echo "  Local:  http://localhost:3001"
+fi
+STARTEOF
 chmod +x "$INSTALL_DIR/start.sh"
+ok "start.sh created"
 
-# ── Create config template ──────────────────────
-echo "[8/8] Creating config template..."
-cat > "$CONFIG_DIR/config.yaml" << CONFIGYAML
+# ── Create config.yaml ────────────────────────────
+step "9/9 — Goose configuration"
+
+if [ -f "$CONFIG_DIR/config.yaml" ]; then
+    warn "Config already exists at $CONFIG_DIR/config.yaml"
+    warn "Backing up to config.yaml.bak"
+    cp "$CONFIG_DIR/config.yaml" "$CONFIG_DIR/config.yaml.bak"
+fi
+
+cat > "$CONFIG_DIR/config.yaml" << CONFIGEOF
 extensions:
   todo:
     enabled: true
@@ -452,7 +395,7 @@ extensions:
     type: stdio
     name: Council of Mine
     description: LLM council debate with 9 distinct personas for decision-making
-    cmd: \$HOME/.local/bin/uvx
+    cmd: $UVX_PATH
     args:
     - --from
     - git+https://github.com/block/mcp-council-of-mine
@@ -462,32 +405,222 @@ extensions:
     timeout: 300
     bundled: null
     available_tools: []
+  fetch:
+    enabled: true
+    type: stdio
+    name: Fetch
+    description: Web content fetching and conversion to markdown
+    display_name: Fetch
+    cmd: $UVX_PATH
+    args:
+    - mcp-server-fetch
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  pdfreader:
+    enabled: true
+    type: stdio
+    name: PDF Reader
+    description: Read large and complex PDF documents
+    display_name: PDF Reader
+    cmd: $UVX_PATH
+    args:
+    - mcp-read-pdf
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  youtube_transcript:
+    enabled: true
+    type: stdio
+    name: YouTube Transcript
+    description: Extract video transcripts from YouTube
+    display_name: YouTube Transcript
+    cmd: $UVX_PATH
+    args:
+    - --from
+    - git+https://github.com/jkawamoto/mcp-youtube-transcript
+    - mcp-youtube-transcript
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  context7:
+    enabled: true
+    type: stdio
+    name: Context7
+    description: Access up-to-date code documentation and examples for any library
+    display_name: Context7
+    cmd: $NPX_PATH
+    args:
+    - -y
+    - '@upstash/context7-mcp'
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  repomix:
+    enabled: true
+    type: stdio
+    name: Repomix
+    description: Repository analysis and code organization into single files
+    display_name: Repomix
+    cmd: $NPX_PATH
+    args:
+    - -y
+    - repomix-mcp
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  knowledgegraph:
+    enabled: true
+    type: stdio
+    name: Knowledge Graph Memory
+    description: Graph-based memory system for persistent knowledge storage
+    display_name: Knowledge Graph Memory
+    cmd: $NPX_PATH
+    args:
+    - -y
+    - '@modelcontextprotocol/server-memory'
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  beads:
+    enabled: true
+    type: stdio
+    name: Beads
+    description: Git-backed issue tracker for AI agent task management
+    display_name: Beads
+    cmd: $UVX_PATH
+    args:
+    - beads-mcp
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  promptschat:
+    enabled: true
+    type: stdio
+    name: prompts.chat
+    description: Access thousands of curated AI prompts
+    display_name: prompts.chat
+    cmd: $NPX_PATH
+    args:
+    - -y
+    - '@fkadev/prompts.chat-mcp@latest'
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  excalidraw:
+    enabled: true
+    type: streamable_http
+    name: Excalidraw
+    description: Diagramming and visual collaboration
+    display_name: Excalidraw
+    uri: https://excalidraw-mcp-app.vercel.app/mcp
+    envs: {}
+    env_keys: []
+    headers: {}
+    timeout: 300
+    bundled: null
+    available_tools: []
+  goosedocs:
+    enabled: true
+    type: stdio
+    name: Goose Docs
+    description: Access Goose documentation via GitMCP
+    display_name: Goose Docs
+    cmd: $NPX_PATH
+    args:
+    - -y
+    - mcp-remote
+    - https://block.gitmcp.io/goose/
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  containeruse:
+    enabled: true
+    type: stdio
+    name: Container Use
+    description: Container workflows and Docker integration
+    display_name: Container Use
+    cmd: $NPX_PATH
+    args:
+    - -y
+    - mcp-remote
+    - https://container-use.com/mcp
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
+  playwright:
+    enabled: true
+    type: stdio
+    name: Playwright
+    description: Browser automation and web interaction via accessibility snapshots
+    display_name: Playwright
+    cmd: $NPX_PATH
+    args:
+    - -y
+    - '@playwright/mcp@latest'
+    envs: {}
+    env_keys: []
+    timeout: 300
+    bundled: null
+    available_tools: []
 GOOSE_TELEMETRY_ENABLED: true
 GOOSE_PROVIDER: claude-code
-GOOSE_MODEL: opus[1m]
+GOOSE_MODEL: 'opus[1m]'
 CLAUDE_CODE_COMMAND: $CLAUDE_PATH
 GOOSE_MAX_TURNS: 5000
 SECURITY_PROMPT_ENABLED: true
-CONFIGYAML
+CONFIGEOF
 
-echo "  Config template created at $CONFIG_DIR/config.yaml"
+ok "Config written to $CONFIG_DIR/config.yaml"
+info "26 extensions configured (all no-API-key)"
 
-# ── Tailscale operator setup ────────────────────
+# ── Done ──────────────────────────────────────────
 echo ""
-echo "============================================"
-echo "  Installation Complete!"
-echo "============================================"
+echo "╔════════════════════════════════════════════╗"
+echo "║         Installation Complete!             ║"
+echo "╚════════════════════════════════════════════╝"
 echo ""
-echo "Installed to: $INSTALL_DIR"
+echo "  Installed to: $INSTALL_DIR"
 echo ""
-echo "Next steps:"
-echo "  1. Ensure Tailscale is logged in: tailscale status"
-echo "  2. Allow non-root funnel (one-time):"
-echo "     sudo tailscale set --operator=\$USER"
-echo "  3. Log into Claude CLI:"
+echo "  Next steps:"
+echo ""
+echo "  1. Log into Claude CLI:"
 echo "     claude login"
-echo "  4. If needed, copy frontend assets:"
-echo "     scp -r /path/to/frontend/* $INSTALL_DIR/frontend/"
-echo "  5. Start Goose Web:"
+echo ""
+if command -v tailscale &>/dev/null; then
+    echo "  2. Allow non-root Tailscale Funnel (one-time):"
+    echo "     sudo tailscale set --operator=\$USER"
+    echo ""
+fi
+if [ ! -f "$INSTALL_DIR/frontend/index.html" ]; then
+    echo "  3. Copy frontend assets:"
+    echo "     On a machine with the Goose desktop app, run:"
+    echo "       ./package-frontend.sh"
+    echo "     Then copy and extract:"
+    echo "       scp goose-frontend.tar.gz $(whoami)@\$(hostname):$INSTALL_DIR/"
+    echo "       cd $INSTALL_DIR && mkdir -p frontend && tar xzf goose-frontend.tar.gz -C frontend"
+    echo ""
+fi
+echo "  Start Goose Web:"
 echo "     ~/goose-web/start.sh"
 echo ""
