@@ -342,8 +342,11 @@ function makeSession(id) {
   };
 }
 
-function makeMessage(role, text) {
+var messageIdCounter = 0;
+
+function makeMessage(role, text, id) {
   return {
+    id: id || ('msg_' + Date.now() + '_' + (++messageIdCounter)),
     role: role,
     created: Math.floor(Date.now() / 1000),
     content: [{ type: 'text', text: text }],
@@ -351,17 +354,11 @@ function makeMessage(role, text) {
   };
 }
 
-// Cache goosed WS token and session ID (fetched once from goosed's session page)
+// Goosed WS token (stable per server instance, cached after first fetch)
 var goosedWSToken = null;
-var goosedSessionId = null;
 
-function fetchGoosedInfo(callback) {
-  if (goosedWSToken && goosedSessionId) {
-    callback(goosedWSToken, goosedSessionId);
-    return;
-  }
-
-  // Fetch root to get redirect (session ID is in the redirect path)
+// Fetch a fresh goosed session. Token is cached (stable), session is always fresh.
+function fetchGoosedSession(callback) {
   var options = {
     hostname: GOOSED_HOST,
     port: GOOSED_PORT,
@@ -370,12 +367,20 @@ function fetchGoosedInfo(callback) {
     headers: { 'x-secret-key': SECRET },
   };
   var req = http.request(options, function(res2) {
+    var newSessionId = null;
     if (res2.statusCode === 303 && res2.headers.location) {
-      // Extract session ID from redirect path like /session/20260301_16
       var sessionMatch = res2.headers.location.match(/\/session\/([^/]+)/);
-      if (sessionMatch) goosedSessionId = sessionMatch[1];
+      if (sessionMatch) newSessionId = sessionMatch[1];
 
-      // Follow redirect to get WS token
+      // If we already have the token, skip fetching the HTML page
+      if (goosedWSToken) {
+        res2.resume(); // consume body
+        console.log('[WS] New goosed session: ' + newSessionId + ' (token cached)');
+        callback(goosedWSToken, newSessionId);
+        return;
+      }
+
+      // First time: follow redirect to get WS token from the page
       var redirectOpts = Object.assign({}, options, { path: res2.headers.location });
       var req2 = http.request(redirectOpts, function(res3) {
         var body = '';
@@ -383,25 +388,26 @@ function fetchGoosedInfo(callback) {
         res3.on('end', function() {
           var match = body.match(/GOOSE_WS_TOKEN\s*=\s*'([^']+)'/);
           if (match) goosedWSToken = match[1];
-          console.log('[WS] goosed session: ' + goosedSessionId + ', token: ' + (goosedWSToken || '').substring(0, 8) + '...');
-          callback(goosedWSToken || '', goosedSessionId || '');
+          console.log('[WS] goosed session: ' + newSessionId + ', token: ' + (goosedWSToken || '').substring(0, 8) + '...');
+          callback(goosedWSToken || '', newSessionId || '');
         });
       });
-      req2.on('error', function() { callback('', ''); });
+      req2.on('error', function() { callback(goosedWSToken || '', newSessionId || ''); });
       req2.end();
     } else {
       var body = '';
       res2.on('data', function(chunk) { body += chunk; });
       res2.on('end', function() {
-        var match = body.match(/GOOSE_WS_TOKEN\s*=\s*'([^']+)'/);
-        if (match) goosedWSToken = match[1];
-        callback(goosedWSToken || '', goosedSessionId || '');
+        if (!goosedWSToken) {
+          var match = body.match(/GOOSE_WS_TOKEN\s*=\s*'([^']+)'/);
+          if (match) goosedWSToken = match[1];
+        }
+        callback(goosedWSToken || '', newSessionId || '');
       });
     }
-    // Consume any remaining data
     res2.resume();
   });
-  req.on('error', function() { callback('', ''); });
+  req.on('error', function() { callback(goosedWSToken || '', ''); });
   req.end();
 }
 
@@ -416,7 +422,7 @@ function connectGooseWS(sessionId, callback) {
   };
   activeSessions[sessionId] = session;
 
-  fetchGoosedInfo(function(token, gooseSessionId) {
+  fetchGoosedSession(function(token, gooseSessionId) {
     session.goosedSessionId = gooseSessionId;
     var wsUrl = 'ws://' + GOOSED_HOST + ':' + GOOSED_PORT + '/ws?token=' + encodeURIComponent(token);
     var ws = new WebSocket(wsUrl);
@@ -433,7 +439,6 @@ function connectGooseWS(sessionId, callback) {
     ws.on('message', function(data) {
       try {
         var msg = JSON.parse(data.toString());
-        if (msg.type !== 'response') console.log('[WS] Received: type=' + msg.type);
         // Notify all listeners (SSE connections waiting for responses)
         session.listeners.forEach(function(listener) { listener(msg); });
       } catch(e) {
@@ -558,8 +563,10 @@ function handleAgentEndpoint(req, res, urlPath) {
         'Access-Control-Allow-Origin': '*',
       });
 
-      var accumulatedText = '';
       var finished = false;
+      // Stable message ID for this response — frontend uses this to append
+      // content to the same message bubble instead of creating new ones
+      var assistantMsgId = 'msg_' + Date.now() + '_' + (++messageIdCounter);
 
       function sendSSE(eventType, data) {
         if (finished && eventType !== 'close') return;
@@ -567,44 +574,53 @@ function handleAgentEndpoint(req, res, urlPath) {
         res.write('data: ' + JSON.stringify(data) + '\n\n');
       }
 
-      // Listen for WebSocket messages
+      // Listen for WebSocket messages from goosed
+      // goosed sends delta chunks: {type:"response", content:"chunk"}
+      // Frontend $Ae() function appends content when message.id matches
       function onWSMessage(msg) {
         if (finished) return;
 
         switch (msg.type) {
           case 'response':
-            accumulatedText += (msg.content || '');
+            // Send delta chunk with stable ID — frontend appends to same message
             sendSSE('message', {
               type: 'Message',
-              message: makeMessage('assistant', accumulatedText),
+              message: makeMessage('assistant', msg.content || '', assistantMsgId),
               token_state: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
             });
             break;
 
           case 'thinking':
-            // Send as a message event with thinking content
             sendSSE('message', {
               type: 'Message',
-              message: makeMessage('assistant', msg.content || '(thinking...)'),
+              message: makeMessage('assistant', msg.content || '(thinking...)', assistantMsgId),
               token_state: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
             });
             break;
 
           case 'tool_request':
-            // Forward tool requests as message events
-            var toolText = accumulatedText;
-            if (msg.tool) {
-              toolText += '\n[Using tool: ' + (msg.tool.name || msg.tool) + ']';
+            // New message ID for tool requests (separate bubble)
+            var toolMsgId = 'msg_tool_' + Date.now() + '_' + (++messageIdCounter);
+            var toolText = '';
+            if (msg.tool_name) {
+              toolText = '[Using tool: ' + msg.tool_name + ']';
+            } else if (msg.tool) {
+              toolText = '[Using tool: ' + (msg.tool.name || msg.tool) + ']';
+            } else {
+              toolText = '(using tools...)';
             }
             sendSSE('message', {
               type: 'Message',
-              message: makeMessage('assistant', toolText || '(using tools...)'),
+              message: makeMessage('assistant', toolText, toolMsgId),
               token_state: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
             });
+            // Next response chunks get a new ID (post-tool continuation)
+            assistantMsgId = 'msg_' + Date.now() + '_' + (++messageIdCounter);
             break;
 
           case 'tool_response':
-            // Tool completed, send update
+            // Tool completed — next response chunks go to a new message
+            assistantMsgId = 'msg_' + Date.now() + '_' + (++messageIdCounter);
             break;
 
           case 'tool_confirmation':
@@ -625,7 +641,6 @@ function handleAgentEndpoint(req, res, urlPath) {
               token_state: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
             });
             finished = true;
-            // Remove listener
             var idx = session.listeners.indexOf(onWSMessage);
             if (idx >= 0) session.listeners.splice(idx, 1);
             res.end();
@@ -643,7 +658,6 @@ function handleAgentEndpoint(req, res, urlPath) {
             break;
 
           default:
-            // Forward unknown events
             break;
         }
       }
