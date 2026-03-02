@@ -261,6 +261,19 @@ extensions:
     timeout: 300
     bundled: null
     available_tools: []
+  ollama_aitopatom:
+    enabled: true
+    type: streamable_http
+    name: Ollama (aitopatom GPU)
+    description: Local LLM on DGX Spark #1 — text generation, code analysis, summarization via qwen3:30b
+    display_name: Ollama GPU
+    uri: http://192.168.1.127:8001/mcp
+    envs: {}
+    env_keys: []
+    headers: {}
+    timeout: 600
+    bundled: null
+    available_tools: []
   goosedocs:
     enabled: true
     type: stdio
